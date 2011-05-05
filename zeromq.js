@@ -99,6 +99,39 @@ sockProp('multicastRecovery', zmq.ZMQ_RECOVERY_IVL);
 sockProp('sendBufferSize',    zmq.ZMQ_SNDBUF);
 sockProp('diskOffloadSize',   zmq.ZMQ_SWAP);
 
+// Set number of simultaneous recvs to throttle at. Zero means no throttling and is default.
+// Must call recvComplete() for each message processed or we will end up stuck.
+Socket.prototype.getThrottle = function(){ return this._throttle; };
+// if set lower than before then we will slough off over time.
+Socket.prototype.setThrottle = function(throttle){ 
+  this._throttle = throttle;
+  if (throttle <= 0) {
+    this._throttled = false;
+    _activeRecv = 0;
+  } else {
+    this._throttled = true;
+  }
+};
+
+/** Release {{num}} or 1 if unspecified recv blocks. @see throttle setter/getter. */
+Socket.prototype.recvComplete = function(num) {
+  if (!this._throttled) return;
+  this._activeRecv -= (num || 1);
+
+  if (this._activeRecv < 0) {
+    console.warn("ZMQ::Throttle: Freed too many recvs.");
+    this._activeRecv = 0;
+  }
+
+  this._flush();
+}
+
+/** Throttling is enabled and max recvs met. */
+Socket.prototype.isBeingThrottled = function() {
+  return this._throttled && this._throttle <= this._activeRecv;
+}
+
+
 // `bind` and `connect` map directly to our binding.
 Socket.prototype.bind = function(addr, cb) {
   var self = this;
@@ -166,7 +199,6 @@ Socket.prototype.currentSendBacklog = function() {
 // This helper is called from `send` above, and in response to
 // the watcher noticing the signaller fd is readable.
 Socket.prototype._flush = function() {
-
   // Don't allow recursive flush invocation as it can lead to stack
   // exhaustion and write starvation
   if (this._inFlush === true) { return; }
@@ -184,14 +216,15 @@ Socket.prototype._flush = function() {
         break;
       }
 
-      if (flags & zmq.ZMQ_POLLIN) {
+      if ((flags & zmq.ZMQ_POLLIN) && !this.isBeingThrottled()) {
           emitArgs = ['message'];
           do {
             emitArgs.push(this._zmq.recv());
           } while (this._receiveMore);
 
+          this._activeRecv++;
           this.emit.apply(this, emitArgs);
-          if (this._zmq.state != zmq.STATE_READY) {
+          if (this._zmq.state != zmq.STATE_READY || this.isBeingThrottled()) {
             this._inFlush = false;
             return;
           }
@@ -240,6 +273,9 @@ exports.createSocket = function(typename, options) {
       }
     }
   }
+
+  sock._throttled = false;
+  sock._activeRecv = 0;
 
   return sock;
 };
